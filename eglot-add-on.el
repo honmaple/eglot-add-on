@@ -26,9 +26,20 @@
 ;;; Code:
 
 (require 'eglot)
-(require 'cape)
 
-(defvar eglot-add-on-modes nil)
+(defgroup eglot-add-on nil
+  "Eglot support multi server."
+  :group 'eglot)
+
+(defcustom eglot-add-on-modes
+  '((web-mode
+     :add-on (web-emmet-mode)
+     :completion (web-mode web-emmet-mode)
+     :diagnostics web-mode))
+  "The modes that would start multi server."
+  :type '(list)
+  :group 'eglot-add-on)
+
 (defvar eglot-add-on-major-mode nil)
 (defvar-local eglot-add-on--cached-server (make-hash-table :test #'equal)
   "A cached reference to the current Eglot server.")
@@ -95,7 +106,7 @@
 ;;;###autoload
 (define-minor-mode eglot-add-on-mode
   "Mode for eglot add multi server support."
-  :init-value nil :lighter nil :keymap eglot-mode-map
+  :global t :group 'eglot
   (cond
    (eglot-add-on-mode
     (advice-add 'eglot--connect :around #'eglot-add-on--connect-around)
