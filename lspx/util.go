@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
 	"reflect"
 	"slices"
-	"io"
-	"errors"
+	"strconv"
+	"strings"
+
+	"github.com/bytedance/sonic"
 )
 
 type piperwc struct {
@@ -22,6 +28,55 @@ func (c piperwc) Write(p []byte) (int, error) {
 
 func (c piperwc) Close() error {
 	return errors.Join(c.stdin.Close(), c.stdout.Close())
+}
+
+type VSCodeObjectCodec struct{}
+
+func (VSCodeObjectCodec) WriteObject(stream io.Writer, obj any) error {
+	data, err := sonic.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(stream, "Content-Length: %d\r\n\r\n", len(data)); err != nil {
+		return err
+	}
+	if _, err := stream.Write(data); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (VSCodeObjectCodec) ReadObject(stream *bufio.Reader, v any) error {
+	var contentLength uint64
+	for {
+		line, err := stream.ReadString('\r')
+		if err != nil {
+			return err
+		}
+		b, err := stream.ReadByte()
+		if err != nil {
+			return err
+		}
+		if b != '\n' {
+			return fmt.Errorf(`jsonrpc2: line endings must be \r\n`)
+		}
+		if line == "\r" {
+			break
+		}
+		if strings.HasPrefix(line, "Content-Length: ") {
+			line = strings.TrimPrefix(line, "Content-Length: ")
+			line = strings.TrimSpace(line)
+			var err error
+			contentLength, err = strconv.ParseUint(line, 10, 32)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if contentLength == 0 {
+		return fmt.Errorf("jsonrpc2: no Content-Length header found")
+	}
+	return sonic.ConfigDefault.NewDecoder(io.LimitReader(stream, int64(contentLength))).Decode(v)
 }
 
 func merge(o, n any) any {

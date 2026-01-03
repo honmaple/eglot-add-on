@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 
+	"github.com/bytedance/sonic"
 	"github.com/sourcegraph/jsonrpc2"
 	"go.lsp.dev/protocol"
 )
@@ -70,10 +71,33 @@ func (s *ProcessServer) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *js
 }
 
 func (s *ProcessServer) handle(ctx context.Context, req *jsonrpc2.Request) (any, error) {
-	if s.name == "tailwindcss-language-server" {
-		if req.Method == protocol.MethodClientRegisterCapability {
+	var params any = req.Params
+
+	switch req.Method {
+	case protocol.MethodInitialize:
+		var newParams protocol.InitializeParams
+		if err := sonic.Unmarshal(*req.Params, &newParams); err != nil {
+			return nil, err
+		}
+		if newParams.InitializationOptions != nil {
+			options := make(map[string]any)
+			b, err := sonic.Marshal(newParams.InitializationOptions)
+			if err != nil {
+				return nil, err
+			}
+			if err := sonic.Unmarshal(b, &options); err != nil {
+				return nil, err
+			}
+			if opt, ok := options[s.name]; ok {
+				newParams.InitializationOptions = opt
+			}
+			params = newParams
+		}
+	case protocol.MethodClientRegisterCapability:
+		if s.name == "tailwindcss-language-server" {
 			var newParams protocol.RegistrationParams
-			if err := json.Unmarshal(*req.Params, &newParams); err != nil {
+
+			if err := sonic.Unmarshal(*req.Params, &newParams); err != nil {
 				return nil, err
 			}
 			for i := range newParams.Registrations {
@@ -87,18 +111,13 @@ func (s *ProcessServer) handle(ctx context.Context, req *jsonrpc2.Request) (any,
 					}
 				}
 			}
-			var result json.RawMessage
-
-			if err := s.proxyConn.Call(ctx, req.Method, newParams, &result); err != nil {
-				return nil, err
-			}
-			return result, nil
+			params = newParams
 		}
 	}
 
 	var result json.RawMessage
 
-	if err := s.proxyConn.Call(ctx, req.Method, req.Params, &result); err != nil {
+	if err := s.proxyConn.Call(ctx, req.Method, params, &result); err != nil {
 		return nil, err
 	}
 	return result, nil
@@ -126,6 +145,6 @@ func NewProcessServer(ctx context.Context, cmd *exec.Cmd) (*ProcessServer, error
 		stdout: stdin,
 	}
 
-	proc.conn = jsonrpc2.NewConn(ctx, jsonrpc2.NewBufferedStream(proc, jsonrpc2.VSCodeObjectCodec{}), proc)
+	proc.conn = jsonrpc2.NewConn(ctx, jsonrpc2.NewBufferedStream(proc, VSCodeObjectCodec{}), proc)
 	return proc, nil
 }

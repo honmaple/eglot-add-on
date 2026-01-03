@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"sync"
 
+	"github.com/bytedance/sonic"
 	"github.com/sourcegraph/jsonrpc2"
 	"go.lsp.dev/protocol"
 	"golang.org/x/sync/errgroup"
@@ -27,8 +30,12 @@ func (c stdrwc) Close() error {
 }
 
 type ProxyServer struct {
-	conn  *jsonrpc2.Conn
-	procs []*ProcessServer
+	conn      *jsonrpc2.Conn
+	procs     []*ProcessServer
+	providers map[string][]string
+
+	diagMu    sync.Mutex
+	diagCache map[protocol.DocumentURI]map[string][]protocol.Diagnostic
 }
 
 func handleProcs[T any](ctx context.Context, req *jsonrpc2.Request, procs []*ProcessServer) ([]T, error) {
@@ -64,9 +71,34 @@ func (s *ProxyServer) Close() error {
 	return s.conn.Close()
 }
 
+func (s *ProxyServer) getProcIndex(conn *jsonrpc2.Conn) int {
+	for i, proc := range s.procs {
+		if proc.conn == conn {
+			return i
+		}
+	}
+	return -1
+}
+
 func (s *ProxyServer) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) {
 	if req.Notif {
-		if err := s.handleNotify(ctx, req); err != nil {
+		procIdx := s.getProcIndex(conn)
+		if procIdx != -1 {
+			if err := s.handleNotify(ctx, req, s.procs[procIdx]); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+			}
+			return
+		}
+		eg := errgroup.Group{}
+
+		for _, proc := range s.procs {
+			newProc := proc
+
+			eg.Go(func() error {
+				return newProc.Notify(ctx, req.Method, req.Params)
+			})
+		}
+		if err := eg.Wait(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 		}
 		return
@@ -87,29 +119,92 @@ func (s *ProxyServer) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *json
 	}
 }
 
-func (s *ProxyServer) handleNotify(ctx context.Context, req *jsonrpc2.Request) error {
-	eg := errgroup.Group{}
+func (s *ProxyServer) handleNotify(ctx context.Context, req *jsonrpc2.Request, proc *ProcessServer) error {
+	var params any = req.Params
 
-	for _, proc := range s.procs {
-		newProc := proc
-
-		eg.Go(func() error {
-			return newProc.Notify(ctx, req.Method, req.Params)
-		})
+	switch req.Method {
+	case protocol.MethodTextDocumentPublishDiagnostics:
+		newParams, err := s.handleTextDocumentPublishDiagnostics(req, proc)
+		if err != nil {
+			return err
+		}
+		params = newParams
 	}
-	return eg.Wait()
+	return s.conn.Notify(ctx, req.Method, params)
+}
+
+func (s *ProxyServer) handleTextDocumentPublishDiagnostics(req *jsonrpc2.Request, proc *ProcessServer) (any, error) {
+	var params protocol.PublishDiagnosticsParams
+	if err := sonic.Unmarshal(*req.Params, &params); err != nil {
+		return nil, err
+	}
+
+	s.diagMu.Lock()
+	defer s.diagMu.Unlock()
+
+	if s.diagCache[params.URI] == nil {
+		s.diagCache[params.URI] = make(map[string][]protocol.Diagnostic)
+	}
+
+	sourceTag := proc.Name()
+	for i := range params.Diagnostics {
+		if params.Diagnostics[i].Source == "" {
+			params.Diagnostics[i].Source = sourceTag
+		}
+	}
+	s.diagCache[params.URI][sourceTag] = params.Diagnostics
+
+	mergedDiagnostics := []protocol.Diagnostic{}
+	for _, diags := range s.diagCache[params.URI] {
+		mergedDiagnostics = append(mergedDiagnostics, diags...)
+	}
+
+	return protocol.PublishDiagnosticsParams{
+		URI:         params.URI,
+		Diagnostics: mergedDiagnostics,
+	}, nil
+}
+
+func (s *ProxyServer) getProcsByProviders(method string) []*ProcessServer {
+	providerMap := map[string]string{
+		protocol.MethodTextDocumentHover:      "hover",
+		protocol.MethodTextDocumentCompletion: "completion",
+		protocol.MethodTextDocumentDefinition: "definition",
+		protocol.MethodTextDocumentRename:     "rename",
+		protocol.MethodTextDocumentReferences: "references",
+	}
+
+	m, ok := providerMap[method]
+	if !ok {
+		return s.procs
+	}
+	providers, ok := s.providers[m]
+	if !ok || len(providers) == 0 {
+		return s.procs
+	}
+
+	procs := make([]*ProcessServer, 0)
+	for _, proc := range s.procs {
+		if slices.Contains(providers, proc.Name()) {
+			procs = append(procs, proc)
+		}
+	}
+	if len(procs) == 0 {
+		return s.procs
+	}
+	return procs
 }
 
 func (s *ProxyServer) handle(ctx context.Context, req *jsonrpc2.Request) (any, error) {
+	procs := s.getProcsByProviders(req.Method)
+
 	switch req.Method {
 	case protocol.MethodInitialize:
-		return s.handleInitialize(ctx, req)
+		return s.handleInitialize(ctx, req, s.procs)
 	case protocol.MethodTextDocumentCompletion:
-		return s.handleTextDocumentCompletion(ctx, req)
-	// case protocol.MethodTextDocumentPublishDiagnostics:
-	//	return s.handleTextDocumentPublishDiagnostics(ctx, req)
+		return s.handleTextDocumentCompletion(ctx, req, procs)
 	default:
-		results, err := handleProcs[json.RawMessage](ctx, req, s.procs)
+		results, err := handleProcs[json.RawMessage](ctx, req, procs)
 		if err != nil {
 			return nil, err
 		}
@@ -117,8 +212,8 @@ func (s *ProxyServer) handle(ctx context.Context, req *jsonrpc2.Request) (any, e
 	}
 }
 
-func (s *ProxyServer) handleInitialize(ctx context.Context, req *jsonrpc2.Request) (any, error) {
-	results, err := handleProcs[protocol.InitializeResult](ctx, req, s.procs)
+func (s *ProxyServer) handleInitialize(ctx context.Context, req *jsonrpc2.Request, procs []*ProcessServer) (any, error) {
+	results, err := handleProcs[protocol.InitializeResult](ctx, req, procs)
 	if err != nil {
 		return nil, err
 	}
@@ -139,8 +234,8 @@ func (s *ProxyServer) handleInitialize(ctx context.Context, req *jsonrpc2.Reques
 	return inititalize, nil
 }
 
-func (s *ProxyServer) handleTextDocumentCompletion(ctx context.Context, req *jsonrpc2.Request) (any, error) {
-	results, err := handleProcs[protocol.CompletionList](ctx, req, s.procs)
+func (s *ProxyServer) handleTextDocumentCompletion(ctx context.Context, req *jsonrpc2.Request, procs []*ProcessServer) (any, error) {
+	results, err := handleProcs[protocol.CompletionList](ctx, req, procs)
 	if err != nil {
 		return nil, err
 	}
@@ -159,19 +254,13 @@ func (s *ProxyServer) handleTextDocumentCompletion(ctx context.Context, req *jso
 	return completion, nil
 }
 
-// func (s *ProxyServer) handleTextDocumentPublishDiagnostics(ctx context.Context, req *jsonrpc2.Request) (any, error) {
-//	results, err := handleProcs[protocol.PublishDiagnosticsParams](ctx, req, s.procs)
-//	if err != nil {
-//		return nil, err
-//	}
-//	return results[0], nil
-// }
-
-func NewProxyServer(ctx context.Context, procs []*ProcessServer) (*ProxyServer, error) {
+func NewProxyServer(ctx context.Context, procs []*ProcessServer, providers map[string][]string) (*ProxyServer, error) {
 	proxy := &ProxyServer{
-		procs: procs,
+		procs:     procs,
+		providers: providers,
+		diagCache: make(map[protocol.DocumentURI]map[string][]protocol.Diagnostic),
 	}
-	proxy.conn = jsonrpc2.NewConn(ctx, jsonrpc2.NewBufferedStream(stdrwc{}, jsonrpc2.VSCodeObjectCodec{}), proxy)
+	proxy.conn = jsonrpc2.NewConn(ctx, jsonrpc2.NewBufferedStream(stdrwc{}, VSCodeObjectCodec{}), proxy)
 	for _, proc := range procs {
 		proc.proxyConn = proxy.conn
 	}
