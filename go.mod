@@ -1,4 +1,4 @@
-module github.com/honmaple/lspx
+module github.com/honmaple/eglot-lspx
 
 go 1.25.5
 
