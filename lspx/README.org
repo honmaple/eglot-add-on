@@ -1,0 +1,8 @@
+#+begin_example
+./lspx \
+--provider completion=vscode-html-language-server,tailwindcss-language-server \
+--provider hover=vscode-html-language-server \
+-p definition=vscode-html-language-server \
+-- vscode-html-language-server --stdio \
+-- tailwindcss-language-server --stdio
+#+end_example
